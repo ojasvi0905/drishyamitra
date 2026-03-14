@@ -1,0 +1,82 @@
+from flask import Blueprint, request, current_app
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from utils.responses import success_response, error_response
+from utils.validation import validate_json_fields
+from services.ai_service import AIService
+from models.database import db
+from models.chat_log import ChatLog
+from datetime import datetime
+import threading
+
+chat_bp = Blueprint('chat', __name__)
+ai_service = AIService()
+
+def log_chat_async(app, user_id, query, response, is_fallback=False):
+    """Background task to log chat interactions"""
+    with app.app_context():
+        try:
+            new_log = ChatLog(
+                user_id=user_id,
+                user_query=query, # Updated from query to user_query
+                response=response,
+                is_fallback=is_fallback
+            )
+            db.session.add(new_log)
+            db.session.commit()
+        except Exception as e:
+            app.logger.error(f"Failed to log chat: {e}")
+
+@chat_bp.route('/', methods=['POST'])
+@jwt_required()
+@validate_json_fields('message')
+def chat():
+    """AI Chat Endpoint with Intent Extraction and Action Dispatch"""
+    user_id = get_jwt_identity()
+    data = request.get_json()
+    user_message = data.get('message')
+    history = data.get('history', [])
+    
+    try:
+        ai_response_obj = ai_service.get_response(user_message, history, user_id=user_id)
+        
+        if isinstance(ai_response_obj, dict):
+            ai_response = ai_response_obj.get("response", "")
+            action_data = ai_response_obj.get("data", None)
+        else:
+            ai_response = ai_response_obj
+            action_data = None
+            
+        is_fallback = "trouble connecting" in ai_response.lower() or "unrecognised intent" in ai_response.lower()
+        
+        threading.Thread(
+            target=log_chat_async,
+            args=(current_app._get_current_object(), user_id, user_message, ai_response, is_fallback)
+        ).start()
+        
+        return success_response({
+            "response": ai_response,
+            "data": action_data,
+            "timestamp": datetime.utcnow().isoformat()
+        }, message="AI response generated successfully")
+    except Exception as e:
+        current_app.logger.error(f"Chat Route Error: {e}")
+        return error_response(message=f"Failed to generate AI response: {str(e)}", status_code=500)
+
+@chat_bp.route('/clear', methods=['DELETE'])
+@jwt_required()
+def clear_chat():
+    """Clear chat history for the current user"""
+    try:
+        # Explicitly cast user_id to int to avoid potential type mismatch with DB column
+        user_id = int(get_jwt_identity())
+        
+        # Now that 'query' column is renamed to 'user_query', we can use ChatLog.query safely.
+        deleted_count = ChatLog.query.filter_by(user_id=user_id).delete(synchronize_session=False)
+        db.session.commit()
+        
+        current_app.logger.info(f"Cleared {deleted_count} chat log entries for user_id: {user_id}")
+        return success_response(message="Chat history cleared successfully")
+    except Exception as e:
+        db.session.rollback()
+        current_app.logger.error(f"Failed to clear chat: {e}")
+        return error_response(message=f"Failed to clear chat: {str(e)}", status_code=500)
